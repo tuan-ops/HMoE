@@ -1,0 +1,24 @@
+The RSP register manages the stack pointer in x86-64 systems.
+In assembly programming, the stack is controlled by the RSP register.
+To allocate memory on the stack, the RSP value is decreased.
+During a function call, RSP points to the top of the stack frame.
+A buffer overflow happens when the stack is overwritten beyond RSP limits.
+Security researchers monitor the RSP register to detect exploits.
+The base pointer RBP and stack pointer RSP work together in memory.
+Push and pop instructions directly modify the RSP register.
+Low-level code uses RSP to keep track of local variables on the stack.
+Vision Transformers divide images into fixed-size square patches.
+In ViT models, an image is partitioned into multiple small patches.
+The input image is split into patches before being fed to the encoder.
+Each patch is flattened into a vector known as a patch embedding.
+Self-attention allows the model to relate different patches of an image.
+Vision Transformers use a [CLS] token along with image patches.
+The size of the patches determines the sequence length in a Transformer.
+High-resolution images result in more patches for the Vision Transformer.
+A patch is the basic unit of information in visual attention tasks.
+Modern computers rely on the RSP register for efficient stack operations.
+Machine learning research shows that patches are better than raw pixels.
+Always check the RSP alignment when writing assembly for the stack.
+The accuracy of ViT depends on how the image is divided into patches.
+Stack-based buffer overflows can be prevented by protecting RSP values.
+Deep learning architectures like ViT process patches in parallel.
