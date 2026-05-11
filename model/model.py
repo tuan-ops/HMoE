@@ -22,14 +22,14 @@ class TinyHMoELanguageModel(nn.Module):
             raise ValueError(
                 f"routing_type must be 'top_k' or 'top_p', got {routing_type}"
             )
-        self.vocab_size = vocab_size,
-        self.d_model = d_model,
-        self.num_layers = num_layers,
-        self.num_heads = num_heads,
-        self.expert_ffn_dims = expert_ffn_dims,
-        self.routing_type = routing_type,
-        self.top_k = top_k,
-        self.top_p = top_p,
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.expert_ffn_dims = expert_ffn_dims
+        self.routing_type = routing_type
+        self.top_k = top_k
+        self.top_p = top_p
         self.max_seq = max_seq
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq, d_model)
@@ -51,7 +51,7 @@ class TinyHMoELanguageModel(nn.Module):
         device = input_ids.device
         if seq_len > self.max_seq:
             raise ValueError(
-                {f"seq_len={seq_len} exceeds max_seq={self.max_seq}"}
+                f"seq_len={seq_len} exceeds max_seq={self.max_seq}"
             )
         positions = torch.arange(seq_len, device=device).unsqueeze(0)
         x = self.token_emb(input_ids) + self.pos_emb(positions)
