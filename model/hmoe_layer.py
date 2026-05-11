@@ -23,6 +23,10 @@ class HMoELayer(nn.Module):
         self.p_penalty_coef = p_penalty_coef
         self.entropy_coef = entropy_coef
         self.router = Router(d_model, self.num_experts)
+        self.last_router_probs = None
+        self.last_topk_idx = None
+        self.last_topk_weight = None
+        self.last_expert_mask = None
         self.experts = nn.ModuleList([
             LlamaFFNExpert(d_model, d_ffn)
             for d_ffn in expert_ffn_dims
@@ -43,13 +47,23 @@ class HMoELayer(nn.Module):
             probs,
             k = self.top_k
         )
+        self.last_router_probs = probs.detach()
+        self.last_topk_idx = selected_indices.detach()
+        self.last_topk_weight = selected_probs.detach()
+# Lấy ra các expert được chọn 
+        expert_mask = torch.zeros_like(probs, dtype=torch.bool)
+        expert_mask.scatter(-1, selected_indices, True)
+        self.last_expert_mask = expert_mask.detach()
+        
         output = torch.zeros_like(x)
         x_flat = x.reshape(batch * seq_len, d_model)
         output_flat = output.reshape(batch * seq_len, d_model)
         selected_probs_flat = selected_probs.reshape(-1, self.top_k)
         selected_indices_flat = selected_indices.reshape(-1, self.top_k)
         for expert_id, expert in enumerate(self.experts):
+# Tìm token chọn expert_id
             mask = selected_indices_flat == expert_id
+# Nếu không có token nào chọn expert_id này thì bỏ qua
             if not mask.any():
                 continue
             token_indices, slot_indices = mask.nonzero(as_tuple=True)
@@ -57,6 +71,7 @@ class HMoELayer(nn.Module):
             weights = selected_probs_flat[token_indices, slot_indices].unsqueeze(-1)
 
             expert_out = expert(selected_x)
+# Tổng có trọng số các token được chọn
             output_flat[token_indices] += weights * expert_out
 
         output = output_flat.reshape(batch, seq_len, d_model)
@@ -71,6 +86,22 @@ class HMoELayer(nn.Module):
             batch_size,
             seq_len
         ) = top_p(probs, p = self.top_p)
+        self.last_router_probs = probs.detach()
+        expert_mask_flat = torch.zeros(
+            batch * seq_len,
+            self.num_experts,
+            device=probs.device,
+            dtype=torch.bool,
+        )
+# Lấy expert được chọn
+        expert_mask_flat[token_indices, selected_indices] = True
+        
+        self.last_expert_mask = expert_mask_flat.reshape(
+            batch,
+            seq_len,
+            self.num_experts
+        ).detach()
+        
         output = torch.zeros_like(x)
         x_flat = x.reshape(batch * seq_len, d_model)
         output_flat = output.reshape(batch * seq_len, d_model)
@@ -82,6 +113,7 @@ class HMoELayer(nn.Module):
             selected_x = x_flat[selected_token_indices]
             weights = selected_probs[mask].unsqueeze(-1)
             expert_out = expert(selected_x)
+# Tổng các expert có trọng số
             output_flat[selected_token_indices] += weights * expert_out
         output = output_flat.reshape(batch, seq_len, d_model)
         aux_loss = self.compute_p_penalty_top_p(
@@ -93,10 +125,12 @@ class HMoELayer(nn.Module):
         entropy_loss = self.compute_router_entropy(probs)
 
         return output, aux_loss + entropy_loss
+# Hàm loss điều chỉnh quá học chọn expert của router
     def compute_p_penalty_top_k(self, probs, selected_indices):
         batch, seq_len, num_experts = probs.shape
         total_tokens = batch * seq_len
         p_hat = probs.mean(dim=(0,1))
+# Đếm số lần expert được chọn 
         activation_count = torch.zeros(
             num_experts,
             device=probs.device,
@@ -108,7 +142,9 @@ class HMoELayer(nn.Module):
             flat_indices,
             torch.ones_like(flat_indices, dtype = probs.dtype)
         )
+# Tỷ lệ kích hoạt trên tổng token
         activation_ratio = activation_count / total_tokens
+# Tính size expert và chuẩn hóa chia trung bình
         expert_sizes = torch.tensor(
             self.expert_ffn_dims,
             device = probs.device,
@@ -138,13 +174,18 @@ class HMoELayer(nn.Module):
             device = probs.device,
             dtype = probs.dtype
         )
-        m_i = expert_sizes / expert_sizes.mean()
+        expert_sizes = expert_sizes / expert_sizes.mean()
+        m_i = activation_ratio * expert_sizes
         loss = len(self.experts) * torch.sum(p_hat * m_i)
         return self.p_penalty_coef * loss
+# Hàm loss giúp router phân phối token tới expert đều hơn
     def compute_router_entropy(self, probs):
-        loss = len(self.experts) * torch.sum(probs * torch.log(probs.clamp_min(1e-9)),
-                                             dim = -1)
-        return self.entropy_coef * loss
+        entropy = -torch.sum(
+            probs * torch.log(probs.clamp_min(1e-9)),
+            dim=-1
+            ).mean()
+
+        return -self.entropy_coef * entropy
 
                 
         
