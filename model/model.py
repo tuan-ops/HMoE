@@ -12,7 +12,7 @@ class TinyHMoELanguageModel(nn.Module):
         expert_ffn_dims: list[int] | None = None,
         routing_type: str = "top_p",
         top_k: int = 2,
-        top_p: float = 0.1,
+        top_p: float = 0.6,
         max_seq: int = 256
     ):
         super().__init__()

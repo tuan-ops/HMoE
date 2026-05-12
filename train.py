@@ -1,6 +1,7 @@
 
 import argparse
 import os
+import re
 import random
 from dataclasses import dataclass
 
@@ -37,79 +38,328 @@ class TrainConfig:
 
 def validate_cloze(model, dataset, device):
     model.eval()
-    # Các câu test đặc trưng cho 2 domain
+
     test_prompts = [
-        ("The RSP register manages the ", "stack"),
-        ("The encoder block in a Transformer consists of", "attention")
+        ("[ASM] section .text\n", "global"),
+        ("[ASM] mov rax, ", "rbx"),
+        ("[AI] The router assigns each token a probability distribution over ", "experts"),
+        ("[AI] Top-k routing selects the ", "highest"),
+        ("[MATH] The softmax function ", "sigma"),
+        ("[BIO] CRISPR-Cas9 introduces ", "double"),
     ]
+
     results = []
-    
+
     with torch.no_grad():
         for prompt, target in test_prompts:
-            # Tokenize input
             input_indices = [dataset.stoi[c] for c in prompt if c in dataset.stoi]
-            input_tensor = torch.tensor(input_indices, dtype=torch.long).unsqueeze(0).to(device)
-            
-            # Dự đoán 5 ký tự tiếp theo
+
+            if len(input_indices) == 0:
+                results.append(
+                    f"Prompt: '{prompt}' | Pred: '' | [SKIP: prompt không có ký tự trong vocab]"
+                )
+                continue
+
+            input_tensor = torch.tensor(
+                input_indices,
+                dtype=torch.long
+            ).unsqueeze(0).to(device)
+
             pred_str = ""
             current_input = input_tensor
-            for _ in range(7): # Dự đoán độ dài vừa đủ cho 'stack' hoặc 'patches'
-                logits, _ = model(current_input[:, -64:])
-                probs = F.softmax(logits[0, -1,:]/0.6, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).item()
+
+            for _ in range(20):
+                logits, _ = model(current_input[:, -dataset.seq_len:])
+
+                # Greedy để đánh giá ổn định hơn sampling
+                next_token = torch.argmax(logits[0, -1, :]).item()
+
                 char = dataset.itos[next_token]
                 pred_str += char
-                current_input = torch.cat([current_input, torch.tensor([[next_token]]).to(device)], dim=1)
-            
+
+                current_input = torch.cat(
+                    [
+                        current_input,
+                        torch.tensor([[next_token]], device=device)
+                    ],
+                    dim=1
+                )
+
             is_correct = target.lower() in pred_str.lower()
-            results.append(f"Prompt: '{prompt}' | Pred: '{pred_str.strip()}' | {'[OK]' if is_correct else '[FAIL]'}")
-    
+
+            results.append(
+                f"Prompt: '{prompt}' | Pred: '{pred_str.strip()}' | "
+                f"{'[OK]' if is_correct else '[FAIL]'}"
+            )
+
     model.train()
     return results
 
-class CharTextDataset(Dataset):
+def char_tokenize(text: str):
+    """Character-level tokenizer"""
+    return list(text)  # mỗi ký tự là 1 token
 
+class CharTextDataset(Dataset):
     def __init__(self, file_path: str, seq_len: int):
         super().__init__()
 
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
 
-        if len(text) < seq_len + 2:
-            raise ValueError(
-                f"File text quá ngắn. Cần ít nhất {seq_len + 1} ký tự."
-            )
+        tokens = char_tokenize(text)
 
-        chars = sorted(list(set(text)))
+        vocab = sorted(list(set(tokens)))
+        self.stoi = {tok: i for i, tok in enumerate(vocab)}
+        self.itos = {i: tok for tok, i in self.stoi.items()}
 
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for ch, i in self.stoi.items()}
-
-        self.vocab_size = len(chars)
+        self.vocab_size = len(vocab)
         self.seq_len = seq_len
 
-        self.data = torch.tensor(
-            [self.stoi[ch] for ch in text],
-            dtype=torch.long,
-        )
+        self.data = torch.tensor([self.stoi[tok] for tok in tokens], dtype=torch.long)
 
     def __len__(self):
         return len(self.data) - self.seq_len
 
     def __getitem__(self, idx):
-        chunk = self.data[idx : idx + self.seq_len + 1]
-        input_ids = chunk[:-1]
-        labels = chunk[1:]
-        return input_ids, labels
-
-
+        chunk = self.data[idx: idx + self.seq_len + 1]
+        return chunk[:-1], chunk[1:]
 
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def collect_hmoe_router_stats(model):
+    stats = {}
 
+    for name, module in model.named_modules():
+        if not hasattr(module, "last_router_probs"):
+            continue
+
+        probs = module.last_router_probs
+        expert_mask = module.last_expert_mask
+
+        if probs is None or expert_mask is None:
+            continue
+
+        # probs: [batch, seq_len, num_experts]
+        # expert_mask: [batch, seq_len, num_experts]
+
+        num_experts = probs.shape[-1]
+
+        # Xác suất trung bình router gán cho từng expert
+        mean_probs = probs.mean(dim=(0, 1))
+
+        # Tỉ lệ token thực sự chọn từng expert
+        usage = expert_mask.float().mean(dim=(0, 1))
+
+        # Entropy: router phân tán hay tự tin
+        entropy = -torch.sum(
+            probs * torch.log(probs.clamp_min(1e-9)),
+            dim=-1
+        ).mean()
+
+        # Balance CV: càng cao càng lệch expert
+        usage_mean = usage.mean().clamp_min(1e-9)
+        balance_cv = usage.std() / usage_mean
+
+        layer_stats = {
+            "entropy": entropy.item(),
+            "balance_cv": balance_cv.item(),
+            "mean_probs": mean_probs.detach().cpu().tolist(),
+            "usage": usage.detach().cpu().tolist(),
+        }
+
+        if hasattr(module, "last_topk_idx") and module.last_topk_idx is not None:
+            layer_stats["topk_idx_shape"] = tuple(module.last_topk_idx.shape)
+
+        stats[name] = layer_stats
+
+    return stats
+def print_hmoe_router_stats(model, step: int):
+    stats = collect_hmoe_router_stats(model)
+
+    if not stats:
+        print("[router] Không tìm thấy HMoE router stats. Hãy kiểm tra đã lưu last_router_probs chưa.")
+        return
+
+    print(f"\n[Router stats @ step {step}]")
+
+    for layer_name, s in stats.items():
+        print(f"  Layer: {layer_name}")
+        print(f"    entropy    : {s['entropy']:.4f}")
+        print(f"    balance_cv : {s['balance_cv']:.4f}")
+
+        usage_str = " | ".join(
+            f"E{i}: {v:.3f}"
+            for i, v in enumerate(s["usage"])
+        )
+
+        prob_str = " | ".join(
+            f"E{i}: {v:.3f}"
+            for i, v in enumerate(s["mean_probs"])
+        )
+
+        print(f"    usage      : {usage_str}")
+        print(f"    mean_probs : {prob_str}")
+
+        if "topk_idx_shape" in s:
+            print(f"    topk shape : {s['topk_idx_shape']}")
+def print_token_expert_mix_and_p_penalty(
+    model,
+    dataset,
+    input_ids,
+    max_tokens: int = 80,
+):
+    """
+    In từng token đang chọn expert nhỏ/lớn nào,
+    weight bao nhiêu, và token đó đóng góp p-penalty thế nào.
+
+    Chỉ dùng rõ nhất với routing_type='top_k'.
+    """
+
+    print("\n[Token expert mix + p-penalty view]")
+
+    found = False
+
+    for layer_name, module in model.named_modules():
+        if not hasattr(module, "last_topk_idx"):
+            continue
+
+        if module.last_topk_idx is None or module.last_topk_weight is None:
+            continue
+
+        found = True
+
+        topk_idx = module.last_topk_idx.detach().cpu()          # [B, T, K]
+        topk_weight = module.last_topk_weight.detach().cpu()    # [B, T, K]
+
+        expert_sizes = torch.tensor(
+            module.expert_ffn_dims,
+            dtype=torch.float32,
+        )
+
+        num_experts = len(expert_sizes)
+
+        # Chuẩn hóa size để biết expert nào nhỏ/to
+        # Ví dụ [2,3,4,5] / mean = [0.57,0.86,1.14,1.43]
+        size_norm = expert_sizes / expert_sizes.mean()
+
+        print(f"\n  Layer: {layer_name}")
+        print("  Expert size map:")
+
+        for i, size in enumerate(expert_sizes.tolist()):
+            if i < num_experts // 2:
+                size_tag = "SMALL"
+            else:
+                size_tag = "LARGE"
+
+            print(
+                f"    E{i}: d_ffn={int(size)} "
+                f"size_norm={size_norm[i].item():.3f} "
+                f"{size_tag}"
+            )
+
+        sample_token_ids = input_ids[0].detach().cpu().tolist()
+        seq_len = min(max_tokens, len(sample_token_ids), topk_idx.shape[1])
+
+        print("\n  Token routes:")
+
+        total_small_weight = 0.0
+        total_large_weight = 0.0
+        total_p_token = 0.0
+
+        for t in range(seq_len):
+            token_id = sample_token_ids[t]
+            ch = dataset.itos[token_id]
+
+            experts = topk_idx[0, t].tolist()
+            weights = topk_weight[0, t].tolist()
+
+            small_w = 0.0
+            large_w = 0.0
+            p_token = 0.0
+
+            route_parts = []
+
+            for e, w in zip(experts, weights):
+                e_size_norm = size_norm[e].item()
+
+                # Đóng góp p-penalty token:
+                # weight router * normalized expert size
+                contrib = float(w) * e_size_norm
+                p_token += contrib
+
+                if e < num_experts // 2:
+                    small_w += float(w)
+                    tag = "S"
+                else:
+                    large_w += float(w)
+                    tag = "L"
+
+                route_parts.append(
+                    f"E{e}({tag},size={e_size_norm:.2f}):w={float(w):.2f},p={contrib:.3f}"
+                )
+
+            total_small_weight += small_w
+            total_large_weight += large_w
+            total_p_token += p_token
+
+            route_str = " + ".join(route_parts)
+
+            print(
+                f"    t={t:02d} token={repr(ch):>6s} "
+                f"small_w={small_w:.2f} "
+                f"large_w={large_w:.2f} "
+                f"p_token={p_token:.3f} "
+                f"| {route_str}"
+            )
+
+        if seq_len > 0:
+            print("\n  Summary on printed tokens:")
+            print(f"    avg_small_weight : {total_small_weight / seq_len:.3f}")
+            print(f"    avg_large_weight : {total_large_weight / seq_len:.3f}")
+            print(f"    avg_p_token      : {total_p_token / seq_len:.3f}")
+
+        # Chỉ in layer đầu tiên cho đỡ dài.
+        # Nếu muốn in mọi layer, xóa break này.
+        break
+
+    if not found:
+        print("  Không tìm thấy top-k route cache. Kiểm tra HMoELayer đã lưu last_topk_idx/last_topk_weight chưa.")
+def print_active_parameter_efficiency(model):
+    print("\n[HMoE active expert size efficiency]")
+
+    for layer_name, module in model.named_modules():
+        if not hasattr(module, "last_topk_idx"):
+            continue
+
+        if module.last_topk_idx is None or module.last_topk_weight is None:
+            continue
+
+        topk_idx = module.last_topk_idx
+        topk_weight = module.last_topk_weight
+
+        expert_dims = torch.tensor(
+            module.expert_ffn_dims,
+            device=topk_weight.device,
+            dtype=topk_weight.dtype,
+        )
+
+        selected_dims = expert_dims[topk_idx]  # [B, T, K]
+
+        weighted_dim = (topk_weight * selected_dims).sum(dim=-1)  # [B, T]
+
+        avg_active_dim = weighted_dim.mean()
+        max_dim = expert_dims.max()
+        relative_active_dim = avg_active_dim / max_dim
+
+        print(f"  Layer: {layer_name}")
+        print(f"    avg_active_expert_dim : {avg_active_dim.item():.2f}")
+        print(f"    max_expert_dim        : {max_dim.item():.2f}")
+        print(f"    relative_active_dim   : {relative_active_dim.item():.4f}")
+
+        break
 def build_model(cfg: TrainConfig, device: torch.device):
 
     if cfg.model_type == "moe":
@@ -219,12 +469,19 @@ def train(cfg: TrainConfig):
 
             logits, aux_loss = model(input_ids)
 
-            lm_loss = F.cross_entropy(
+# Loss từng token/ký tự: [batch_size, seq_len]
+            token_loss = F.cross_entropy(
                 logits.reshape(-1, cfg.vocab_size),
                 labels.reshape(-1),
-            )
+                reduction="none",
+            ).reshape(labels.shape)
+
+# Loss trung bình để backward như bình thường
+            lm_loss = token_loss.mean()
+
             if aux_loss.dim() > 0:
                 aux_loss = aux_loss.mean()
+
             loss = lm_loss + aux_loss
 
             optimizer.zero_grad(set_to_none=True)
@@ -238,14 +495,25 @@ def train(cfg: TrainConfig):
             optimizer.step()
 
             if step % 50 == 0:
-                print(f"\n[Step {step:04d}] Loss: {lm_loss.item():.4f}")
+                print(f"\n[Step {step:04d}]")
+                print(f"  lm_loss  : {lm_loss.item():.4f}")
+                print(f"  aux_loss : {aux_loss.item():.4f}")
+                print(f"  total    : {loss.item():.4f}")
+
+                print_hmoe_router_stats(model, step)
+                print_token_expert_mix_and_p_penalty(
+                    model=model,
+                    dataset=dataset,
+                    input_ids=input_ids,
+                    max_tokens=80,
+                    )
+
                 val_results = validate_cloze(model, dataset, device)
                 for res in val_results:
                     print(f"  > {res}")
+
                 print("-" * 50)
-
             step += 1
-
     save_checkpoint(model, optimizer, cfg, step)
     print("[done] training finished")
 
@@ -278,8 +546,8 @@ def parse_args():
     parser.add_argument("--num_heads", type=int, default=4)
 
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_steps", type=int, default=500)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--num_steps", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
 
     parser.add_argument("--save_dir", type=str, default="checkpoints")
