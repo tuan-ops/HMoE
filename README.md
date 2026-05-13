@@ -64,7 +64,7 @@ Input token IDs  [B, T]
 
 `total_loss = lm_loss + aux_loss`
 
-> **Lưu ý:** `lm_loss` thấp (dưới 0.5) không đồng nghĩa model generate tốt. Dataset sinh từ template lặp lại khiến model học thống kê ký tự rất nhanh nhưng chưa chắc tổng quát hóa được khi generate autoregressive.
+> **Lưu ý:** `lm_loss` thấp (dưới 0.5) không đồng nghĩa model generate tốt. Dataset sinh từ template lặp lại khiến model học thống kê ký tự rất nhanh nhưng chưa chắc tổng quát hóa được khi tự tạo mô hình hồi quy.
 
 ---
 
@@ -73,8 +73,6 @@ Input token IDs  [B, T]
 ```bash
 pip install torch
 ```
-
-Không cần thư viện ngoài nào khác.
 
 ---
 
@@ -92,23 +90,15 @@ Tạo ra:
 - `data/domain_2_math.txt` — Toán học (hard)
 - `data/domain_3_bio.txt` — Sinh học phân tử (hard+)
 
-> **Quan trọng:** Phải chạy `data_set.py` trước khi train. Nếu dùng file data sai (không sinh từ script này), cloze test sẽ cho kết quả vô nghĩa vì vocab và pattern không khớp domain.
+> **Quan trọng:** Phải chạy `data_set.py` trước khi train. Nếu dùng file data sai (không sinh từ script này), test sẽ cho kết quả vô nghĩa vì vocab và pattern không khớp domain.
 
 ---
 
 ## Huấn luyện
 
 ```bash
-# Chạy nhanh để thử (vài phút)
-python train.py \
-  --routing_type top_k \
-  --top_k 2 \
-  --num_steps 400 \
-  --d_model 256 \
-  --num_layers 4 \
-  --batch_size 32
 
-# Chạy đầy đủ để model hội tụ tốt
+# Chạy model
 python train.py \
   --routing_type top_k \
   --top_k 2 \
@@ -142,8 +132,6 @@ python train.py \
 | `--save_every` | `100` | Lưu checkpoint mỗi N bước |
 | `--seed` | `42` | Random seed |
 
-> **Lưu ý:** `TrainConfig` dataclass có giá trị mặc định khác với `parse_args` (ví dụ `d_model=128` vs `256`). Luôn chạy qua `python train.py --...` thay vì khởi tạo `TrainConfig()` trực tiếp trong code.
-
 ---
 
 ## Checkpoint
@@ -157,12 +145,10 @@ Checkpoint được lưu tự động theo hai cách:
 
 ```bash
 python inspect_checkpoint.py
-# Sửa đường dẫn trong __main__ cho đúng file cần xem
 ```
 
 Output bao gồm: config, danh sách tensor và shape, thông tin optimizer.
 
-> **Lưu ý:** `history` chưa được lưu vào checkpoint — `inspect_checkpoint.py` sẽ báo "Không có history" — đây là hành vi bình thường của phiên bản hiện tại.
 
 ---
 
@@ -222,8 +208,5 @@ Mỗi 50 bước script in loss, router stats, và cloze test:
 - Tokenization ở **cấp ký tự** (character-level), không dùng BPE/WordPiece. Vocab size thường 80–120 ký tự tùy dataset.
 - Model sử dụng **positional embedding học được** (không phải sinusoidal), giới hạn bởi `max_seq`.
 - Expert FFN theo kiến trúc **SwiGLU** (`gate × up → down`), giống LLaMA.
-- **Gradient clipping** `max_norm=1.0` áp dụng mỗi bước — cần thiết vì gradient từ nhiều expert cộng lại dễ spike.
 - **Causal mask** (triangular upper) tạo trong `model.py`, đảm bảo attention chỉ nhìn về quá khứ.
-- `token_loss` tính với `reduction="none"` giữ nguyên shape `[B, T]` rồi mới `.mean()` — cho phép mở rộng sau này như per-token weighting hoặc per-domain loss tracking.
-- `print_token_expert_mix_and_p_penalty` chỉ in **1 lần duy nhất** ở bước đầu tiên để tránh output quá dài.
-- `print_active_parameter_efficiency` được định nghĩa trong `train.py` nhưng chưa được gọi trong vòng lặp — có thể bật thủ công khi cần debug routing efficiency.
+
