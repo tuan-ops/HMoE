@@ -10,8 +10,8 @@ class HMoELayer(nn.Module):
         routing_type: str = "top_k",
         top_k: int = 2,
         top_p: float = 0.6,
-        p_penalty_coef: float = 0.1,
-        entropy_coef: float = 0.1
+        p_penalty_coef: float = 0.01,
+        entropy_coef: float = 0.0
     ):
         super().__init__()
         self.d_model = d_model
@@ -52,7 +52,7 @@ class HMoELayer(nn.Module):
         self.last_topk_weight = selected_probs.detach()
 # Lấy ra các expert được chọn 
         expert_mask = torch.zeros_like(probs, dtype=torch.bool)
-        expert_mask.scatter(-1, selected_indices, True)
+        expert_mask.scatter_(-1, selected_indices, True)
         self.last_expert_mask = expert_mask.detach()
         
         output = torch.zeros_like(x)

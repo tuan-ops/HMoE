@@ -23,6 +23,9 @@ class Router(nn.Module):
         return probs
 # Xây dựng chiến lược top-k: chọn k-expert có xác suất cao nhất cho mỗi token 
 def top_k(probs: torch.Tensor, k: int):
+    num_experts = probs.shape[-1]
+    if not (1 <= k <= num_experts):
+        raise ValueError(f"top_k must be in [1, {num_experts}], got {k}")
     selected_probs, selected_indices = torch.topk(probs, k = k, dim = -1)
     # Chuẩn hóa lại xác suất k expert được chọn
     selected_probs = selected_probs/selected_probs.sum(
@@ -32,6 +35,8 @@ def top_k(probs: torch.Tensor, k: int):
     return selected_probs, selected_indices
 # Xây dựng chiến lược top-p: chọn số expert linh hoạt sao cho tổng xác suất chạm hoặc vượt ngưỡng p
 def top_p(probs: torch.Tensor, p: float):
+    if not (0.0 < p <= 1.0):
+        raise ValueError(f"top_p must be in (0, 1], got {p}")
     batch_size, seq_len, num_experts = probs.shape
 # Gộp batch_size và seq_len thành một chiều token -> tổng số token 
 # Mỗi token sẽ có số expert khác nhau 
