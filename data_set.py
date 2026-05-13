@@ -201,8 +201,6 @@ def bio_block():
         lines.append(tmpl)
     return " ".join(lines)
 
-# Main: generate interleaved dataset with domain markers
-
 GENERATORS = [asm_block, ai_block, math_block, bio_block]
 DOMAIN_NAMES = ["[ASM]", "[AI]", "[MATH]", "[BIO]"]
 

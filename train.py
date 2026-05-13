@@ -10,22 +10,30 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from model.model import TinyHMoELanguageModel
-
+from metrics_utils import (
+    count_parameters,
+    evaluate,
+    TrainSpeedMeter,
+    reset_peak_vram,
+    get_peak_vram_mb,
+    save_metrics_json,
+    print_metrics_table
+)
 
 @dataclass
 class TrainConfig:
     data_path: str = "data/tiny_text.txt"
 
     vocab_size: int = 0
-    max_seq: int = 64
+    max_seq: int = 128
 
-    d_model: int = 128
-    num_layers: int = 2
+    d_model: int = 256
+    num_layers: int = 4
     num_heads: int = 4
 
     batch_size: int = 8
     num_steps: int = 500
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-4
     weight_decay: float = 0.01
     model_type: str = "hmoe"
     routing_type: str = "top_k"
@@ -35,12 +43,11 @@ class TrainConfig:
     save_dir: str = "checkpoints"
     save_every: int = 100
     seed: int = 42
-
+# Hàm suy luận đưa ra dự đoán token tiếp theo
 def validate_cloze(model, dataset, device):
     model.eval()
 
     test_prompts = [
-        ("[ASM] section .text\n", "global"),
         ("[ASM] mov rax, ", "rbx"),
         ("[AI] The router assigns each token a probability distribution over ", "experts"),
         ("[AI] Top-k routing selects the ", "highest"),
@@ -67,13 +74,13 @@ def validate_cloze(model, dataset, device):
 
             pred_str = ""
             current_input = input_tensor
-
+# vòng lặp sẽ sinh 20 từ tiếp theo từ câu promt
             for _ in range(20):
                 logits, _ = model(current_input[:, -dataset.seq_len:])
 
-                # Greedy để đánh giá ổn định hơn sampling
-                next_token = torch.argmax(logits[0, -1, :]).item()
-
+# Sử dụng chiến lược greedy để chọn từ tiếp theo
+                next_token = torch.argmax(logits[0,-1, :]).item()
+                
                 char = dataset.itos[next_token]
                 pred_str += char
 
@@ -84,20 +91,28 @@ def validate_cloze(model, dataset, device):
                     ],
                     dim=1
                 )
+                if target.lower() in pred_str.lower():
+                    break
+            pred_display = pred_str.strip()
+            target_lower = target.lower()
+            pred_lower = pred_display.lower()
+            is_correct = target_lower in pred_lower
 
-            is_correct = target.lower() in pred_str.lower()
+            if is_correct:
+                end_pos = pred_lower.find(target_lower) + len(target)
+                pred_display = pred_display[:end_pos]
 
             results.append(
-                f"Prompt: '{prompt}' | Pred: '{pred_str.strip()}' | "
+                f"Prompt: '{prompt}' | Pred: '{pred_display}' | "
                 f"{'[OK]' if is_correct else '[FAIL]'}"
             )
 
     model.train()
     return results
-
+# Xử lý đầu vào mỗi kí tự sẽ là một token
 def char_tokenize(text: str):
     """Character-level tokenizer"""
-    return list(text)  # mỗi ký tự là 1 token
+    return list(text) 
 
 class CharTextDataset(Dataset):
     def __init__(self, file_path: str, seq_len: int):
@@ -133,7 +148,14 @@ def collect_hmoe_router_stats(model):
     stats = {}
 
     for name, module in model.named_modules():
+        # Chỉ lấy module HMoELayer thật sự, bỏ qua Router con
+        if not hasattr(module, "experts"):
+            continue
+
         if not hasattr(module, "last_router_probs"):
+            continue
+
+        if not hasattr(module, "last_expert_mask"):
             continue
 
         probs = module.last_router_probs
@@ -142,24 +164,23 @@ def collect_hmoe_router_stats(model):
         if probs is None or expert_mask is None:
             continue
 
-        # probs: [batch, seq_len, num_experts]
-        # expert_mask: [batch, seq_len, num_experts]
+        # Đảm bảo lấy đúng shape [batch, seq_len, num_experts]
+        if probs.dim() != 3 or expert_mask.dim() != 3:
+            continue
 
-        num_experts = probs.shape[-1]
+        # Nếu mask toàn 0 thì báo debug để biết layer nào lỗi
+        mask_sum = expert_mask.sum().item()
 
-        # Xác suất trung bình router gán cho từng expert
         mean_probs = probs.mean(dim=(0, 1))
 
-        # Tỉ lệ token thực sự chọn từng expert
+        # usage[i] = tỉ lệ token thực tế có chọn expert i
         usage = expert_mask.float().mean(dim=(0, 1))
 
-        # Entropy: router phân tán hay tự tin
         entropy = -torch.sum(
             probs * torch.log(probs.clamp_min(1e-9)),
             dim=-1
         ).mean()
 
-        # Balance CV: càng cao càng lệch expert
         usage_mean = usage.mean().clamp_min(1e-9)
         balance_cv = usage.std() / usage_mean
 
@@ -168,6 +189,7 @@ def collect_hmoe_router_stats(model):
             "balance_cv": balance_cv.item(),
             "mean_probs": mean_probs.detach().cpu().tolist(),
             "usage": usage.detach().cpu().tolist(),
+            "mask_sum": mask_sum,
         }
 
         if hasattr(module, "last_topk_idx") and module.last_topk_idx is not None:
@@ -180,7 +202,7 @@ def print_hmoe_router_stats(model, step: int):
     stats = collect_hmoe_router_stats(model)
 
     if not stats:
-        print("[router] Không tìm thấy HMoE router stats. Hãy kiểm tra đã lưu last_router_probs chưa.")
+        print("[router] Không tìm thấy HMoE router stats.")
         return
 
     print(f"\n[Router stats @ step {step}]")
@@ -212,10 +234,8 @@ def print_token_expert_mix_and_p_penalty(
     max_tokens: int = 80,
 ):
     """
-    In từng token đang chọn expert nhỏ/lớn nào,
+    Chỉ ra từng token đang chọn expert nhỏ/lớn nào,
     weight bao nhiêu, và token đó đóng góp p-penalty thế nào.
-
-    Chỉ dùng rõ nhất với routing_type='top_k'.
     """
 
     print("\n[Token expert mix + p-penalty view]")
@@ -321,8 +341,7 @@ def print_token_expert_mix_and_p_penalty(
             print(f"    avg_large_weight : {total_large_weight / seq_len:.3f}")
             print(f"    avg_p_token      : {total_p_token / seq_len:.3f}")
 
-        # Chỉ in layer đầu tiên cho đỡ dài.
-        # Nếu muốn in mọi layer, xóa break này.
+        # Chỉ in layer đầu tiên
         break
 
     if not found:
@@ -430,6 +449,7 @@ def train(cfg: TrainConfig):
 
     print(f"[info] device       = {device}")
     print(f"[info] routing_type = {cfg.routing_type}")
+    print(f"[info] model_type   = {cfg.model_type}")
 
     dataset = CharTextDataset(
         file_path=cfg.data_path,
@@ -451,6 +471,10 @@ def train(cfg: TrainConfig):
     model = build_model(cfg, device)
     model.train()
 
+    param_info = count_parameters(model)
+    print(f"[info] total_params = {param_info['total_params']:,}")
+    print(f"[info] trainable    = {param_info['trainable_params']:,}")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
@@ -458,6 +482,17 @@ def train(cfg: TrainConfig):
     )
 
     step = 0
+    printed_token_route = False
+
+    # Đo tốc độ train và VRAM peak bằng các hàm đã có trong metrics_utils.py
+    speed_meter = TrainSpeedMeter()
+    speed_meter.start()
+    reset_peak_vram(device)
+
+    # Lưu giá trị cuối để đưa vào metrics JSON
+    last_lm_loss = None
+    last_aux_loss = None
+    last_total_loss = None
 
     while step < cfg.num_steps:
         for input_ids, labels in dataloader:
@@ -466,17 +501,18 @@ def train(cfg: TrainConfig):
 
             input_ids = input_ids.to(device)
             labels = labels.to(device)
+            speed_meter.update(input_ids)
 
             logits, aux_loss = model(input_ids)
 
-# Loss từng token/ký tự: [batch_size, seq_len]
+            # Loss từng token/ký tự: [batch_size, seq_len]
             token_loss = F.cross_entropy(
                 logits.reshape(-1, cfg.vocab_size),
                 labels.reshape(-1),
                 reduction="none",
             ).reshape(labels.shape)
 
-# Loss trung bình để backward như bình thường
+            # Loss trung bình để backward như bình thường
             lm_loss = token_loss.mean()
 
             if aux_loss.dim() > 0:
@@ -494,29 +530,79 @@ def train(cfg: TrainConfig):
 
             optimizer.step()
 
+            last_lm_loss = lm_loss.item()
+            last_aux_loss = aux_loss.item()
+            last_total_loss = loss.item()
+
             if step % 50 == 0:
                 print(f"\n[Step {step:04d}]")
-                print(f"  lm_loss  : {lm_loss.item():.4f}")
-                print(f"  aux_loss : {aux_loss.item():.4f}")
-                print(f"  total    : {loss.item():.4f}")
+                print(f"  lm_loss  : {last_lm_loss:.4f}")
+                print(f"  aux_loss : {last_aux_loss:.4f}")
+                print(f"  total    : {last_total_loss:.4f}")
 
                 print_hmoe_router_stats(model, step)
-                print_token_expert_mix_and_p_penalty(
-                    model=model,
-                    dataset=dataset,
-                    input_ids=input_ids,
-                    max_tokens=80,
+
+                # Chỉ in bảng token-route đúng 1 lần đầu tiên, tối đa 50 token.
+                if not printed_token_route:
+                    print_token_expert_mix_and_p_penalty(
+                        model=model,
+                        dataset=dataset,
+                        input_ids=input_ids,
+                        max_tokens=50,
                     )
+                    printed_token_route = True
 
                 val_results = validate_cloze(model, dataset, device)
                 for res in val_results:
                     print(f"  > {res}")
 
                 print("-" * 50)
-            step += 1
-    save_checkpoint(model, optimizer, cfg, step)
-    print("[done] training finished")
 
+            # Lưu checkpoint định kỳ theo save_every
+            if cfg.save_every > 0 and step > 0 and step % cfg.save_every == 0:
+                save_checkpoint(model, optimizer, cfg, step)
+
+            step += 1
+
+    save_checkpoint(model, optimizer, cfg, step)
+
+    speed_metrics = speed_meter.get_metrics()
+    peak_vram_mb = get_peak_vram_mb(device)
+
+    metrics = {
+        "model_type": cfg.model_type,
+        "routing_type": cfg.routing_type,
+        "top_k": cfg.top_k,
+        "top_p": cfg.top_p,
+        "d_model": cfg.d_model,
+        "num_layers": cfg.num_layers,
+        "num_heads": cfg.num_heads,
+        "max_seq": cfg.max_seq,
+        "batch_size": cfg.batch_size,
+        "num_steps": cfg.num_steps,
+        "learning_rate": cfg.learning_rate,
+        "weight_decay": cfg.weight_decay,
+        "vocab_size": cfg.vocab_size,
+        "total_params": param_info["total_params"],
+        "trainable_params": param_info["trainable_params"],
+        "final_lm_loss": last_lm_loss,
+        "final_aux_loss": last_aux_loss,
+        "final_total_loss": last_total_loss,
+        "train_time_sec": speed_metrics["train_time_sec"],
+        "tokens_seen": speed_metrics["tokens_seen"],
+        "tokens_per_sec": speed_metrics["tokens_per_sec"],
+        "peak_vram_mb": peak_vram_mb,
+    }
+
+    print_metrics_table(metrics)
+
+    save_metrics_json(
+        metrics=metrics,
+        save_dir=cfg.save_dir,
+        filename=f"{cfg.model_type}_{cfg.routing_type}_metrics.json",
+    )
+
+    print("[done] training finished")
 
 
 def parse_args():
@@ -537,17 +623,17 @@ def parse_args():
     "--model_type",
     type=str,
     default="hmoe",
-    choices=["dense", "moe", "hmoe"],
+    choices=["moe", "hmoe"],
 )
 
-    parser.add_argument("--max_seq", type=int, default=64)
+    parser.add_argument("--max_seq", type=int, default=128)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=4)
 
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_steps", type=int, default=100)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_steps", type=int, default=500)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
 
     parser.add_argument("--save_dir", type=str, default="checkpoints")

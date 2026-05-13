@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, Optional 
 import torch
 import torch.nn.functional as F 
+# Hàm đếm tổng số tham số 
 def count_parameters(model: torch.nn.Module) -> Dict[str, int]:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -13,6 +14,7 @@ def count_parameters(model: torch.nn.Module) -> Dict[str, int]:
         "trainable_params": trainable_params
     }
 @torch.no_grad()
+# Hàm đánh giá thông qua loss và perplexity
 def evaluate(
     model: torch.nn.Module,
     dataloader,
@@ -44,6 +46,7 @@ def evaluate(
         "val_loss": avg_loss,
         "val_ppl": perplexity
     }
+# Hàm tính toán tốc độ huấn luyện 
 class TrainSpeedMeter:
 
     def __init__(self):
@@ -78,7 +81,7 @@ class TrainSpeedMeter:
             "tokens_per_sec": tokens_per_sec,
         }
 
-
+# Hàm tính toán bộ nhớ trên VRAM
 def reset_peak_vram(device: torch.device):
 
     if device.type == "cuda":
